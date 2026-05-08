@@ -1,0 +1,83 @@
+# Pi4 Caddy.
+#
+# Role: high-bandwidth content delivery. Listens on :443 inside the container,
+# host-mapped to :8443 (UDR forwards WAN 8443 → pi4:8443). Cert is for the
+# bare hostname (your-host.example.org) issued via DNS-01 (no port-80
+# dependency). Every request is gated against the potato's auth-svc over the
+# edge-net LAN with X-Auth-Mode: gate — a tiny round-trip; the actual
+# response body flows pi4 → user direct.
+
+{
+	email {$ACME_EMAIL}
+	acme_dns duckdns {$DDNS_TOKEN}
+
+	servers {
+		trusted_proxies static private_ranges
+	}
+
+	log default {
+		output stdout
+		format json
+		level INFO
+	}
+}
+
+# Site address binds to the public hostname AND port. We need the explicit
+# port because the listener is :443 inside the container but advertised as
+# :8443 to the public — Caddy's auto-HTTPS keys off this.
+{$HOSTNAME} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=()"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+
+	# Gate every request against the potato's auth-svc. On 200 the request
+	# continues to the local backend; on 302 (no/bad cookie) Caddy passes the
+	# 302 to the client which lands on the potato's /auth/login.
+	forward_auth {$AUTH_UPSTREAM} {
+		uri /auth/check
+		header_up X-Auth-Mode "gate"
+		header_up X-Real-IP {http.request.remote.host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Uri {uri}
+		header_up X-Forwarded-Proto {scheme}
+		copy_headers X-Auth-User X-Auth-Token-Id
+	}
+
+	# /media/* → Jellyfin on mediasrv. Jellyfin should be configured with
+	# BaseUrl=/media so its asset URLs resolve.
+	handle_path /media/* {
+		reverse_proxy {$MEDIASRV_UPSTREAM} {
+			header_up X-Real-IP {http.request.remote.host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			# Jellyfin streams large files + uses websockets.
+			flush_interval -1
+			transport http {
+				read_buffer 64KB
+			}
+		}
+	}
+
+	# Everything else → the React/HeroUI app.
+	reverse_proxy {$WEB_UPSTREAM} {
+		header_up X-Real-IP {http.request.remote.host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

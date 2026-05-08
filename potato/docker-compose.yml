@@ -1,0 +1,146 @@
+# Edge stack for potato (Le Potato 2GB, aarch64).
+#
+# Role: low-bandwidth auth gate. Caddy publishes 80/443 to the host (and the
+# UDR-7 forwards them from the WAN). After a successful auth the user is
+# bounced to https://${HOSTNAME}:${PI4_PUBLIC_PORT} where pi4 serves the
+# actual content over its 1Gbps NIC.
+#
+# auth-svc is attached to BOTH:
+#   - "edge"       (private bridge, container-to-container on the potato)
+#   - "edge-net" (the cross-host network shared with pi4 + mediasrv) so the
+#                  pi4's Caddy can call /auth/check across the LAN.
+#
+# The "edge-net" network must already exist (`docker network create
+# --driver=overlay --attachable edge-net` for Swarm; or your existing
+# Tailscale/macvlan/bridge that already spans the three hosts — keep it
+# consistent on every node).
+
+name: edge-stack
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  caddy:
+    build:
+      context: ./caddy
+    image: local/edge-caddy:latest
+    container_name: edge-caddy
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      HOSTNAME: ${HOSTNAME:?set HOSTNAME in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      DDNS_TOKEN: ${DDNS_TOKEN:?set DDNS_TOKEN in .env}
+      AUTH_UPSTREAM: auth-svc:8080
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    networks:
+      edge:
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      auth-svc:
+        condition: service_healthy
+    logging: *default-logging
+
+  auth-svc:
+    build:
+      context: ./auth-service
+    image: local/auth-svc:latest
+    container_name: auth-svc
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    environment:
+      AUTH_LISTEN: ":8080"
+      AUTH_HOSTNAME: ${HOSTNAME:?}
+      # Where authorized users are sent. Includes the port (8443) because
+      # your-host.example.org:443 stays on the potato as the gate.
+      AUTH_PI4_PUBLIC_URL: ${PI4_PUBLIC_URL:?e.g. https://your-host.example.org:8443}
+      AUTH_SESSION_KEY: ${AUTH_SESSION_KEY:?32+ random bytes, base64}
+      AUTH_ADMIN_TOKEN: ${AUTH_ADMIN_TOKEN:?random opaque string for /auth/admin}
+      AUTH_SESSION_TTL: ${AUTH_SESSION_TTL:-720h}
+      AUTH_DB_PATH: /data/auth.db
+      AUTH_TRUST_FORWARDED: "true"
+      AUTH_VERIFY_LIMIT: ${AUTH_VERIFY_LIMIT:-5}
+      AUTH_VERIFY_WINDOW: ${AUTH_VERIFY_WINDOW:-15m}
+    volumes:
+      - auth_data:/data
+    networks:
+      edge:
+        aliases: [auth-svc]
+      edge-net:
+        # Stable DNS name for the pi4's Caddy to forward_auth against.
+        aliases: [auth-svc]
+    healthcheck:
+      test: ["CMD", "/auth-svc", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *default-logging
+
+  fail2ban:
+    image: crazymax/fail2ban:1.0.2
+    container_name: edge-fail2ban
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      F2B_LOG_LEVEL: INFO
+      F2B_DB_PURGE_AGE: 30d
+      UDR_HOST: ${UDR_HOST:?LAN IP/host of the Dream Router}
+      UDR_USER: ${UDR_USER:?service account username}
+      UDR_PASS: ${UDR_PASS:?service account password}
+      UDR_SITE: ${UDR_SITE:-default}
+      UDR_GROUP_ID: ${UDR_GROUP_ID:?firewall group ID for the deny list}
+      UDR_VERIFY_TLS: ${UDR_VERIFY_TLS:-false}
+    volumes:
+      - ./fail2ban/jail.d:/etc/fail2ban/jail.d:ro
+      - ./fail2ban/filter.d:/etc/fail2ban/filter.d:ro
+      - ./fail2ban/action.d:/etc/fail2ban/action.d:ro
+      - caddy_logs:/var/log/caddy:ro
+      - fail2ban_data:/var/lib/fail2ban
+    logging: *default-logging
+
+volumes:
+  caddy_data:
+  caddy_config:
+  caddy_logs:
+  auth_data:
+  fail2ban_data:
+
+networks:
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.40.0/24
+  edge-net:
+    external: true

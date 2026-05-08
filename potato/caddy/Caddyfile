@@ -1,0 +1,87 @@
+# Edge gateway — potato Caddy.
+#
+# Role: low-bandwidth auth gate. Public 80/443 land here. We serve:
+#   - /auth/*          → reverse_proxy to auth-svc (login page, verify, admin)
+#   - everything else  → forward_auth in "bounce" mode → on valid cookie,
+#                        auth-svc 302s the user to https://${HOSTNAME}:${PI4_PUBLIC_PORT}
+#                        so the bulk traffic flows pi4↔user direct (1Gbps),
+#                        bypassing the potato's 100Mbps NIC.
+#
+# We never reverse_proxy content from here. If somehow a request slips past
+# forward_auth (it shouldn't), the fallback `respond` below catches it.
+
+{
+	email {$ACME_EMAIL}
+
+	# DNS-01 via the configured DDNS provider — port 80 is busy with the
+	# HTTP→HTTPS redirect anyway, and DNS-01 also lets the pi4 issue its own
+	# cert without owning :80. The provider directive name below must match
+	# whichever caddy-dns/* plugin is compiled into the image (see Dockerfile).
+	acme_dns duckdns {$DDNS_TOKEN}
+
+	servers {
+		trusted_proxies static private_ranges
+	}
+
+	log default {
+		output stdout
+		format json
+		level INFO
+	}
+}
+
+# Bare HTTP → HTTPS. ACME challenges go via DNS-01, so :80 has nothing else.
+http://{$HOSTNAME} {
+	redir https://{host}{uri} permanent
+}
+
+{$HOSTNAME} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+
+	# /auth/* — the gate itself. NEVER forward_auth this path (would loop).
+	handle /auth/* {
+		reverse_proxy {$AUTH_UPSTREAM} {
+			header_up X-Real-IP {http.request.remote.host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Everything else — bounce mode. forward_auth → auth-svc. With X-Auth-Mode:
+	# bounce, auth-svc returns 302 to the pi4 public URL on a valid cookie, or
+	# 302 to /auth/login on no/bad cookie. Either way Caddy passes that 302
+	# straight back to the client and we never proxy any content here.
+	handle {
+		forward_auth {$AUTH_UPSTREAM} {
+			uri /auth/check
+			header_up X-Auth-Mode "bounce"
+			header_up X-Real-IP {http.request.remote.host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Uri {uri}
+			header_up X-Forwarded-Proto {scheme}
+			# Don't blindly trust upstream's body — auth-svc only sets headers.
+		}
+		# Defense-in-depth fallback. Should never fire.
+		respond "gate misconfigured" 502
+	}
+}

@@ -1,0 +1,60 @@
+# pi4 edge stack. Caddy only — no auth-svc here; we forward_auth across the
+# LAN to the potato's auth-svc on edge-net.
+#
+# UDR-7 should be configured to forward:
+#   8443/tcp  → pi4 LAN IP : 8443
+#   8443/udp  → pi4 LAN IP : 8443   (HTTP/3)
+# (Ports 80/443 stay on the potato.)
+
+name: web-stack
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  caddy:
+    env_file: .env
+    environment:
+      HOSTNAME: ${HOSTNAME}
+      ACME_EMAIL: ${ACME_EMAIL}
+      DDNS_TOKEN: ${DDNS_TOKEN}
+      # potato auth-svc is reachable on edge-net at this DNS alias.
+      AUTH_UPSTREAM: ${AUTH_UPSTREAM}
+      # Local backends — change these to whatever you name your web/Jellyfin
+      # containers. They must be on edge-net (Jellyfin) or pi4-net (web).
+      WEB_UPSTREAM: ${WEB_UPSTREAM}
+      MEDIASRV_UPSTREAM: ${MEDIASRV_UPSTREAM}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    networks:
+      edge-net:
+      pi4-net:
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *default-logging
+
+volumes:
+  caddy_data:
+  caddy_config:
+  caddy_logs:
+
+networks:
+  # Cross-host network — same external network the potato attaches auth-svc to.
+  edge-net:
+    external: true
+  # Local network for talking to the web app + anything else only pi4 hosts.
+  # Create the pi4-web stack with `networks: [pi4-net]` so it's reachable here.
+  pi4-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.41.0/24
