@@ -56,7 +56,12 @@
 		header_up X-Forwarded-Host {host}
 		header_up X-Forwarded-Uri {uri}
 		header_up X-Forwarded-Proto {scheme}
-		copy_headers X-Auth-User X-Auth-Token-Id
+		# Set-Cookie is essential for Basic-Auth bootstrap: when a Jellyfin
+		# native client first connects with user:token@host, auth-svc mints a
+		# session and Set-Cookies it. URLSession stores the cookie, which
+		# keeps the gate open after Jellyfin's own login replaces the
+		# Authorization header.
+		copy_headers X-Auth-User X-Auth-Token-Id Set-Cookie
 	}
 
 	# /media/* → Jellyfin on mediasrv. Jellyfin should be configured with

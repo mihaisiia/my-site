@@ -157,6 +157,56 @@ Send the `token` to the visitor over a private channel. They paste it into
 `https://your-host.example.org/auth/login`, get bounced to
 `:8443/`, and stay there for 30 days (cookie default).
 
+### Connecting a media client (Jellyfin, etc.)
+
+Native media clients can't follow the browser-form gate flow, so they use
+HTTP Basic Auth as the machine-readable mode. The same site token that
+unlocks the web gate doubles as the Basic-Auth password; the username
+component is ignored.
+
+**URL form** (works in browsers, the official Jellyfin iOS app v1.7+, JMP
+desktop, and most Android clients):
+
+```
+https://anyuser:<site_token>@your-host.example.org:8443/media
+```
+
+Use this string verbatim in the client's "Add Server" field. The `:8443`
+matters — it sends bytes straight to the pi4's 1 Gbps NIC and skips the
+potato. Any username works; pick something memorable like `media`.
+
+**Custom-header form** (for clients that strip URL userinfo):
+
+Some clients (Swiftfin on iOS/tvOS, Findroid on Android) expose a
+"Custom HTTP Headers" field in their server-edit screen. Server URL stays
+plain `https://your-host.example.org:8443/media`, and you add one header:
+
+```
+Authorization: Basic <base64(anyuser:site_token)>
+```
+
+Generate the value with `printf 'anyuser:%s' "$TOKEN" | base64`.
+
+**What happens on first contact:** auth-svc validates the Basic Auth, mints
+a session, and `Set-Cookie`s `site_session` on the response. URLSession
+(iOS/macOS) and most modern HTTP libraries store that cookie automatically.
+On subsequent requests the client sends both the cookie and the Basic Auth
+header — and once the user logs into Jellyfin and the client starts sending
+`Authorization: MediaBrowser Token="..."` instead of Basic, the cookie
+keeps flowing independently and the gate stays open. This sidesteps the
+"Jellyfin's auth header replaces ours" problem.
+
+**Failure modes worth knowing:**
+- Wrong token → 401 on every request → after 5 misses in 15 min the IP is
+  rate-limited (429) by auth-svc, and fail2ban escalates to a UDR firewall
+  block.
+- Client URL on `:443` instead of `:8443` → the gate 302s to `:8443` with
+  the cookie set. Browsers handle this fine; some native clients don't
+  follow cross-port redirects with credentials, so always configure with
+  `:8443` explicitly.
+- Client wipes its cookie jar between sessions → harmless: every fresh
+  start re-bootstraps via Basic Auth on the first request.
+
 ### Revoking
 
 ```bash

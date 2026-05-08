@@ -79,7 +79,9 @@ http://{$HOSTNAME} {
 			header_up X-Forwarded-Host {host}
 			header_up X-Forwarded-Uri {uri}
 			header_up X-Forwarded-Proto {scheme}
-			# Don't blindly trust upstream's body — auth-svc only sets headers.
+			# Set-Cookie propagates the Basic-Auth bootstrap cookie minted by
+			# auth-svc on first contact (see pi4 Caddyfile for the same).
+			copy_headers Set-Cookie
 		}
 		# Defense-in-depth fallback. Should never fire.
 		respond "gate misconfigured" 502

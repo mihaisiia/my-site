@@ -22,32 +22,107 @@ func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // /auth/check is the forward_auth target. Behavior depends on X-Auth-Mode:
 //
 //   - "bounce" (set by the potato Caddy): we are the public gate. Valid
-//     cookie → 302 to the pi4 public URL so the bulk of the traffic flows
-//     pi4↔user direct. Invalid cookie → 302 to the login page (browser) or
+//     auth → 302 to the pi4 public URL so the bulk of the traffic flows
+//     pi4↔user direct. Invalid auth → 302 to the login page (browser) or
 //     401 (API).
 //   - "gate"   (set by the pi4 Caddy): we are the per-request authoriser.
-//     Valid cookie → 200 (request continues to the pi4 backend). Invalid
-//     cookie → 302 to the login page on the potato (absolute URL, since the
-//     302 will be returned to a client connected to the pi4) or 401.
+//     Valid auth → 200 (request continues to the pi4 backend). Invalid auth
+//     → 302 to the login page on the potato (absolute URL, since the 302
+//     will be returned to a client connected to the pi4) or 401.
 //
-// In both modes invalid-cookie 302s are absolute (https://${HOSTNAME}/...)
+// Two auth carriers are accepted:
+//
+//   - Cookie:     site_session, the HMAC-signed session set by
+//                 /auth/verify after a browser-form login.
+//   - Basic Auth: Authorization: Basic <base64(anyuser:site_token)>. Used
+//                 by Jellyfin native clients (URL form: user:token@host) and
+//                 by CLI tools. On a successful Basic Auth with no existing
+//                 cookie we mint a session and Set-Cookie on the response —
+//                 Caddy's forward_auth `copy_headers Set-Cookie` propagates
+//                 it to the client, and URLSession-based apps store it in
+//                 HTTPCookieStorage.shared. That matters because once
+//                 Jellyfin's own login completes, the client starts sending
+//                 `Authorization: MediaBrowser Token="..."` instead of
+//                 Basic, and the gate would otherwise lose visibility into
+//                 who the caller is. Cookies are independent of the
+//                 Authorization header, so the gate keeps recognizing the
+//                 session even after Jellyfin's auth takes over.
+//
+// In both modes invalid-auth 302s are absolute (https://${HOSTNAME}/...)
 // so they work whether forward_auth was triggered from potato or pi4.
 func (s *server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	mode := r.Header.Get("X-Auth-Mode") // "bounce" | "gate" | ""
 
+	// Path 1: existing valid cookie. Cheap, hot path on every request.
 	if sess, ok := s.validSession(r); ok {
-		w.Header().Set("X-Auth-User", sess.id)
-		w.Header().Set("X-Auth-Token-Id", sess.tokenID)
-		if mode == "bounce" {
-			// Authorized — kick the user over to the pi4. We preserve the
-			// original path/query via X-Forwarded-Uri (Caddy sets it).
-			s.bounceToPi4(w, r)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
+		s.authorized(w, r, sess, mode)
 		return
 	}
+
+	// Path 2: HTTP Basic Auth. Username is ignored; the password must equal
+	// a live, non-revoked, non-expired token.
+	if _, pass, hasBasic := r.BasicAuth(); hasBasic && pass != "" {
+		ip := s.realIP(r)
+		tokenID, err := s.store.ConsumeOrTouchToken(r.Context(), pass)
+		if err != nil {
+			// Failed Basic Auth: rate-limit per IP. Successful Basic Auth
+			// (the bulk of traffic for an active client) does NOT increment
+			// the bucket — so a heavy Jellyfin session isn't throttled, but
+			// a brute-force loop is.
+			if !s.allow(ip) {
+				slog.Warn("basic auth rate-limited", "ip", ip)
+				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				return
+			}
+			slog.Info("basic auth failed", "ip", ip, "reason", err.Error())
+			s.unauthorized(w, r)
+			return
+		}
+		// Bootstrap a session bound to this token. The cookie we set here
+		// keeps the client authorized even after Jellyfin replaces the
+		// Authorization header with its own MediaBrowser Token=... value.
+		sess, signed, err := s.newSessionCookie(tokenID)
+		if err != nil {
+			slog.Error("session sign", "err", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		if err := s.store.PutSession(r.Context(), sess.id, tokenID, ip, sess.expires); err != nil {
+			slog.Error("session persist", "err", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookieName,
+			Value:    signed,
+			Path:     "/",
+			Domain:   s.cfg.hostname,
+			Expires:  sess.expires,
+			MaxAge:   int(s.cfg.sessionTTL.Seconds()),
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		slog.Info("session bootstrapped from basic auth",
+			"ip", ip, "session_id", sess.id, "token_id", tokenID)
+		s.authorized(w, r, sess, mode)
+		return
+	}
+
+	// No cookie, no Basic Auth.
 	s.unauthorized(w, r)
+}
+
+// authorized is the success branch shared by the cookie and Basic Auth
+// paths. Sets identity headers and either bounces (potato) or 200s (pi4).
+func (s *server) authorized(w http.ResponseWriter, r *http.Request, sess session, mode string) {
+	w.Header().Set("X-Auth-User", sess.id)
+	w.Header().Set("X-Auth-Token-Id", sess.tokenID)
+	if mode == "bounce" {
+		s.bounceToPi4(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *server) validSession(r *http.Request) (session, bool) {
