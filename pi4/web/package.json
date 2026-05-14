@@ -1,0 +1,14 @@
+{
+  "name": "pi4-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fastify API + React/HeroUI SPA for the pi4 in this stack.",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "build": "npm run -w server build && npm run -w web build",
+    "typecheck": "npm run -w server typecheck && npm run -w web typecheck"
+  }
+}
